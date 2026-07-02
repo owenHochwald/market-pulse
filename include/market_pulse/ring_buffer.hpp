@@ -13,6 +13,7 @@ struct RingStats {
     std::uint64_t pushed = 0;
     std::uint64_t popped = 0;
     std::uint64_t dropped = 0;
+    std::uint64_t current_depth = 0;
     std::uint64_t max_depth = 0;
 };
 
@@ -85,10 +86,13 @@ public:
     }
 
     [[nodiscard]] RingStats stats() const {
+        const auto write_position = write_position_.load(std::memory_order_relaxed);
+        const auto read_position = read_position_.load(std::memory_order_relaxed);
         return RingStats{
             pushed_.load(std::memory_order_relaxed),
             popped_.load(std::memory_order_relaxed),
             dropped_.load(std::memory_order_relaxed),
+            static_cast<std::uint64_t>(write_position - read_position),
             max_depth_.load(std::memory_order_relaxed),
         };
     }
