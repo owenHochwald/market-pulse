@@ -170,6 +170,7 @@ void test_market_simulation_determinism() {
     const auto result = market_pulse::run_simulation(config);
 
     expect(result.generated == 9, "simulation reports generated events");
+    expect(result.accepted == 9, "simulation accepts all deterministic events");
     expect(result.consumed == 9, "simulation consumes all accepted deterministic events");
     expect(result.ring.dropped == 0, "simulation has no drops with sufficient capacity");
     expect(result.per_symbol_counts.size() == 3, "simulation reports each symbol");
@@ -178,6 +179,25 @@ void test_market_simulation_determinism() {
         expect(result.per_symbol_counts[1] == 3, "symbol 1 count is deterministic");
         expect(result.per_symbol_counts[2] == 3, "symbol 2 count is deterministic");
     }
+}
+
+void test_chaos_mode_metrics() {
+    market_pulse::SimulationConfig config;
+    config.symbol_count = 2;
+    config.event_count = 48;
+    config.producer_count = 1;
+    config.capacity = 8;
+    config.seed = 99;
+    config.chaos = true;
+
+    const auto result = market_pulse::run_simulation(config);
+
+    expect(result.generated == 48, "chaos mode reports attempted events");
+    expect(result.accepted == result.consumed, "chaos mode consumes every accepted event");
+    expect(result.halt_events > 0, "chaos mode injects halt events");
+    expect(result.timestamp_skews > 0, "chaos mode injects timestamp skew");
+    expect(result.out_of_order_events > 0, "chaos mode injects out-of-order events");
+    expect(result.burst_storms > 0, "chaos mode reports burst storms");
 }
 
 }  // namespace
@@ -189,6 +209,7 @@ int main() {
     test_ring_buffer_stats_accounting();
     test_ring_buffer_multi_producer_integrity();
     test_market_simulation_determinism();
+    test_chaos_mode_metrics();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;
