@@ -6,6 +6,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -99,6 +101,64 @@ void test_ring_buffer_stats_accounting() {
     expect(stats.max_depth == 2, "stats report peak backlog");
 }
 
+struct ProducerEvent {
+    int producer = 0;
+    int sequence = 0;
+};
+
+void test_ring_buffer_multi_producer_integrity() {
+    constexpr int producer_count = 4;
+    constexpr int events_per_producer = 512;
+    constexpr int total_events = producer_count * events_per_producer;
+
+    market_pulse::RingBuffer<ProducerEvent> buffer(4096);
+    std::vector<std::thread> producers;
+    std::vector<int> seen(total_events, 0);
+    std::atomic<int> consumed{0};
+
+    std::thread consumer([&] {
+        ProducerEvent event;
+        while (consumed.load(std::memory_order_relaxed) < total_events) {
+            if (!buffer.try_pop(event)) {
+                std::this_thread::yield();
+                continue;
+            }
+
+            const int index = event.producer * events_per_producer + event.sequence;
+            if (index >= 0 && index < total_events) {
+                ++seen[static_cast<std::size_t>(index)];
+            }
+            consumed.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    for (int producer = 0; producer < producer_count; ++producer) {
+        producers.emplace_back([&, producer] {
+            for (int sequence = 0; sequence < events_per_producer; ++sequence) {
+                ProducerEvent event{producer, sequence};
+                while (!buffer.try_push(event)) {
+                    std::this_thread::yield();
+                }
+            }
+        });
+    }
+
+    for (auto& producer : producers) {
+        producer.join();
+    }
+    consumer.join();
+
+    for (int count : seen) {
+        expect(count == 1, "multi-producer event delivered exactly once");
+    }
+
+    const auto stats = buffer.stats();
+    expect(stats.pushed == total_events, "multi-producer stats count all pushes");
+    expect(stats.popped == total_events, "multi-producer stats count all pops");
+    expect(stats.dropped == 0, "multi-producer retry loop avoids drops");
+    expect(stats.producer_retries >= 0, "multi-producer stats expose producer CAS retries");
+}
+
 }  // namespace
 
 int main() {
@@ -106,6 +166,7 @@ int main() {
     test_ring_buffer_empty_and_capacity();
     test_ring_buffer_wraparound_ordering();
     test_ring_buffer_stats_accounting();
+    test_ring_buffer_multi_producer_integrity();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;
