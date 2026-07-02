@@ -20,11 +20,11 @@ template <typename T>
 class RingBuffer {
 public:
     explicit RingBuffer(std::size_t capacity)
-        : capacity_(round_up_power_of_two(capacity)),
+        : capacity_(capacity),
           mask_(capacity_ - 1),
           slots_(std::make_unique<Slot[]>(capacity_)) {
-        if (capacity < 2) {
-            throw std::invalid_argument("ring buffer capacity must be at least 2");
+        if (capacity < 2 || !is_power_of_two(capacity)) {
+            throw std::invalid_argument("ring buffer capacity must be a power of two and at least 2");
         }
 
         for (std::size_t i = 0; i < capacity_; ++i) {
@@ -99,12 +99,8 @@ private:
         T value{};
     };
 
-    static std::size_t round_up_power_of_two(std::size_t value) {
-        std::size_t capacity = 1;
-        while (capacity < value) {
-            capacity <<= 1;
-        }
-        return capacity;
+    static bool is_power_of_two(std::size_t value) {
+        return value != 0 && (value & (value - 1)) == 0;
     }
 
     void update_max_depth(std::size_t observed_write_position) {
