@@ -44,7 +44,12 @@ struct SimulationConfig {
 
 struct SimulationResult {
     std::uint64_t generated = 0;
+    std::uint64_t accepted = 0;
     std::uint64_t consumed = 0;
+    std::uint64_t halt_events = 0;
+    std::uint64_t timestamp_skews = 0;
+    std::uint64_t out_of_order_events = 0;
+    std::uint64_t burst_storms = 0;
     std::vector<std::uint64_t> per_symbol_counts;
     RingStats ring;
 };
