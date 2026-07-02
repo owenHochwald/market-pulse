@@ -5,6 +5,7 @@
 #include <iostream>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -200,6 +201,23 @@ void test_chaos_mode_metrics() {
     expect(result.burst_storms > 0, "chaos mode reports burst storms");
 }
 
+void test_cli_summary_output() {
+    market_pulse::SimulationConfig config;
+    config.symbol_count = 2;
+    config.event_count = 16;
+    config.producer_count = 1;
+    config.capacity = 16;
+
+    const auto result = market_pulse::run_simulation(config);
+    const std::string summary = market_pulse::format_simulation_summary(config, result);
+
+    expect(summary.find("market-pulse simulation") != std::string::npos, "summary has title");
+    expect(summary.find("generated=16") != std::string::npos, "summary includes generated count");
+    expect(summary.find("accepted=16") != std::string::npos, "summary includes accepted count");
+    expect(summary.find("drops=0") != std::string::npos, "summary includes drop count");
+    expect(summary.find("p99_latency_ns=") != std::string::npos, "summary includes p99 latency");
+}
+
 }  // namespace
 
 int main() {
@@ -210,6 +228,7 @@ int main() {
     test_ring_buffer_multi_producer_integrity();
     test_market_simulation_determinism();
     test_chaos_mode_metrics();
+    test_cli_summary_output();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;
