@@ -15,6 +15,7 @@ struct RingStats {
     std::uint64_t dropped = 0;
     std::uint64_t current_depth = 0;
     std::uint64_t max_depth = 0;
+    std::uint64_t producer_retries = 0;
 };
 
 template <typename T>
@@ -54,6 +55,7 @@ public:
                     update_max_depth(position + 1);
                     return true;
                 }
+                producer_retries_.fetch_add(1, std::memory_order_relaxed);
             } else if (difference < 0) {
                 dropped_.fetch_add(1, std::memory_order_relaxed);
                 return false;
@@ -94,6 +96,7 @@ public:
             dropped_.load(std::memory_order_relaxed),
             static_cast<std::uint64_t>(write_position - read_position),
             max_depth_.load(std::memory_order_relaxed),
+            producer_retries_.load(std::memory_order_relaxed),
         };
     }
 
@@ -126,6 +129,7 @@ private:
     std::atomic<std::uint64_t> popped_{0};
     std::atomic<std::uint64_t> dropped_{0};
     std::atomic<std::uint64_t> max_depth_{0};
+    std::atomic<std::uint64_t> producer_retries_{0};
 };
 
 }  // namespace market_pulse
