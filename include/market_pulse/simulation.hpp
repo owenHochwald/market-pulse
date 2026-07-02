@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace market_pulse {
@@ -50,11 +51,15 @@ struct SimulationResult {
     std::uint64_t timestamp_skews = 0;
     std::uint64_t out_of_order_events = 0;
     std::uint64_t burst_storms = 0;
+    std::uint64_t p50_latency_ns = 0;
+    std::uint64_t p95_latency_ns = 0;
+    std::uint64_t p99_latency_ns = 0;
     std::vector<std::uint64_t> per_symbol_counts;
     RingStats ring;
 };
 
 int smoke_value();
 SimulationResult run_simulation(const SimulationConfig& config);
+std::string format_simulation_summary(const SimulationConfig& config, const SimulationResult& result);
 
 }  // namespace market_pulse

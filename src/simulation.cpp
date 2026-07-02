@@ -1,6 +1,8 @@
 #include "market_pulse/simulation.hpp"
 
 #include <atomic>
+#include <algorithm>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -51,6 +53,16 @@ MarketEvent make_event(const SimulationConfig& config, std::uint64_t event_id) {
     };
 }
 
+std::uint64_t percentile(std::vector<std::uint64_t>& values, double quantile) {
+    if (values.empty()) {
+        return 0;
+    }
+
+    std::sort(values.begin(), values.end());
+    const auto index = static_cast<std::size_t>((values.size() - 1) * quantile);
+    return values[index];
+}
+
 }  // namespace
 
 SimulationResult run_simulation(const SimulationConfig& config) {
@@ -71,6 +83,8 @@ SimulationResult run_simulation(const SimulationConfig& config) {
     std::atomic<std::uint64_t> burst_storms{0};
     std::atomic<bool> producers_done{false};
     std::vector<std::uint64_t> per_symbol_counts(config.symbol_count, 0);
+    std::vector<std::uint64_t> latencies;
+    latencies.reserve(config.event_count);
 
     std::thread consumer([&] {
         MarketEvent event;
@@ -84,6 +98,10 @@ SimulationResult run_simulation(const SimulationConfig& config) {
             if (event.symbol_id < per_symbol_counts.size()) {
                 ++per_symbol_counts[event.symbol_id];
             }
+            const auto latency = event.receive_timestamp_ns >= event.exchange_timestamp_ns
+                                     ? event.receive_timestamp_ns - event.exchange_timestamp_ns
+                                     : 0;
+            latencies.push_back(latency);
             consumed.fetch_add(1, std::memory_order_relaxed);
         }
     });
@@ -130,6 +148,10 @@ SimulationResult run_simulation(const SimulationConfig& config) {
     producers_done.store(true, std::memory_order_release);
     consumer.join();
 
+    auto p50_values = latencies;
+    auto p95_values = latencies;
+    auto p99_values = latencies;
+
     return SimulationResult{
         generated.load(std::memory_order_relaxed),
         accepted.load(std::memory_order_relaxed),
@@ -138,9 +160,33 @@ SimulationResult run_simulation(const SimulationConfig& config) {
         timestamp_skews.load(std::memory_order_relaxed),
         out_of_order_events.load(std::memory_order_relaxed),
         burst_storms.load(std::memory_order_relaxed),
+        percentile(p50_values, 0.50),
+        percentile(p95_values, 0.95),
+        percentile(p99_values, 0.99),
         per_symbol_counts,
         ring.stats(),
     };
+}
+
+std::string format_simulation_summary(const SimulationConfig& config, const SimulationResult& result) {
+    std::ostringstream output;
+    output << "market-pulse simulation\n"
+           << "symbols=" << config.symbol_count << " events=" << config.event_count
+           << " producers=" << config.producer_count << " capacity=" << config.capacity
+           << " chaos=" << (config.chaos ? "on" : "off") << '\n'
+           << "generated=" << result.generated << " accepted=" << result.accepted
+           << " consumed=" << result.consumed << " drops=" << result.ring.dropped
+           << " producer_retries=" << result.ring.producer_retries << '\n'
+           << "depth_current=" << result.ring.current_depth
+           << " depth_max=" << result.ring.max_depth << '\n'
+           << "p50_latency_ns=" << result.p50_latency_ns
+           << " p95_latency_ns=" << result.p95_latency_ns
+           << " p99_latency_ns=" << result.p99_latency_ns << '\n'
+           << "halt_events=" << result.halt_events
+           << " timestamp_skews=" << result.timestamp_skews
+           << " out_of_order_events=" << result.out_of_order_events
+           << " burst_storms=" << result.burst_storms << '\n';
+    return output.str();
 }
 
 }  // namespace market_pulse

@@ -6,10 +6,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+find_package(Threads REQUIRED)
+
 add_library(market_pulse_lib
     src/simulation.cpp
 )
 target_include_directories(market_pulse_lib PUBLIC include)
+target_link_libraries(market_pulse_lib PUBLIC Threads::Threads)
 target_compile_options(market_pulse_lib PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(market-pulse src/main.cpp)
