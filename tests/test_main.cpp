@@ -159,6 +159,27 @@ void test_ring_buffer_multi_producer_integrity() {
     expect(stats.producer_retries >= 0, "multi-producer stats expose producer CAS retries");
 }
 
+void test_market_simulation_determinism() {
+    market_pulse::SimulationConfig config;
+    config.symbol_count = 3;
+    config.event_count = 9;
+    config.producer_count = 1;
+    config.capacity = 16;
+    config.seed = 1234;
+
+    const auto result = market_pulse::run_simulation(config);
+
+    expect(result.generated == 9, "simulation reports generated events");
+    expect(result.consumed == 9, "simulation consumes all accepted deterministic events");
+    expect(result.ring.dropped == 0, "simulation has no drops with sufficient capacity");
+    expect(result.per_symbol_counts.size() == 3, "simulation reports each symbol");
+    if (result.per_symbol_counts.size() == 3) {
+        expect(result.per_symbol_counts[0] == 3, "symbol 0 count is deterministic");
+        expect(result.per_symbol_counts[1] == 3, "symbol 1 count is deterministic");
+        expect(result.per_symbol_counts[2] == 3, "symbol 2 count is deterministic");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -167,6 +188,7 @@ int main() {
     test_ring_buffer_wraparound_ordering();
     test_ring_buffer_stats_accounting();
     test_ring_buffer_multi_producer_integrity();
+    test_market_simulation_determinism();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;
