@@ -82,12 +82,30 @@ void test_ring_buffer_wraparound_ordering() {
     expect(!buffer.try_pop(value), "wrapped buffer is empty after draining");
 }
 
+void test_ring_buffer_stats_accounting() {
+    market_pulse::RingBuffer<int> buffer(2);
+    int value = 0;
+
+    expect(buffer.try_push(7), "stats test first push succeeds");
+    expect(buffer.try_push(8), "stats test second push succeeds");
+    expect(!buffer.try_push(9), "stats test drop recorded when full");
+    expect(buffer.try_pop(value), "stats test pop succeeds");
+
+    const auto stats = buffer.stats();
+    expect(stats.pushed == 2, "stats count accepted pushes");
+    expect(stats.popped == 1, "stats count successful pops");
+    expect(stats.dropped == 1, "stats count rejected pushes");
+    expect(stats.current_depth == 1, "stats report current backlog");
+    expect(stats.max_depth == 2, "stats report peak backlog");
+}
+
 }  // namespace
 
 int main() {
     test_smoke();
     test_ring_buffer_empty_and_capacity();
     test_ring_buffer_wraparound_ordering();
+    test_ring_buffer_stats_accounting();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;
