@@ -1,84 +1,86 @@
 # market-pulse
 
-`market-pulse` is a C++20 lock-free market replay engine built around a bounded
-MPSC ring buffer. It simulates exchange-style event bursts, pushes them through a
-non-blocking queue, drains them through a single market-state consumer, and
-reports the latency/backpressure metrics that decide whether the system actually
-survives load.
+`market-pulse` is a C++20 market replay engine built around a lock-free,
+multi-producer/single-consumer ring buffer. It generates exchange-style market
+events, pushes them through concurrent producers, drains them through one market
+state consumer, and reports the latency and backpressure metrics that show how
+the system behaves under load.
 
-The twist: chaos mode injects halt/resume events, burst storms, timestamp skew,
-and out-of-order feed behavior so the project is more than a generic ring buffer.
+The project is meant to demonstrate systems work that is easy to run and inspect:
+lock-free data structures, deterministic replay, chaos testing, and a small CLI
+that can push a 5,000,000-event multi-producer replay in a release build.
 
-## Build and Test
+## Highlights
 
-```bash
-cmake -S . -B build
-cmake --build build
-ctest --test-dir build --output-on-failure
-```
+- Lock-free bounded MPSC ring buffer with sequence-numbered slots.
+- Multi-producer market event replay into a single consumer.
+- Throughput-oriented release scenario for 5M+ events/sec on local hardware.
+- Chaos mode for halt/resume events, burst storms, timestamp skew, and
+  out-of-order feed behavior.
+- CLI metrics for accepted/consumed events, queue depth, retries, drops, and
+  p50/p95/p99 replay latency.
+- Self-contained CTest suite covering ring-buffer behavior, concurrency,
+  deterministic replay, chaos metrics, and CLI formatting.
 
-If CMake is unavailable, the core test binary can be compiled directly:
+## Quick Start
 
-```bash
-clang++ -std=c++20 -Wall -Wextra -Wpedantic -Iinclude \
-  src/simulation.cpp tests/test_main.cpp -o /tmp/market_pulse_tests
-/tmp/market_pulse_tests
-```
-
-## Run
-
-```bash
-cmake --build build
-./build/market-pulse simulate --symbols 4 --events 1000 --producers 2 --capacity 1024 --seed 7 --chaos
-```
-
-Direct compiler fallback:
+Download:
 
 ```bash
-clang++ -std=c++20 -Wall -Wextra -Wpedantic -Iinclude \
-  src/simulation.cpp src/main.cpp -o /tmp/market-pulse
-/tmp/market-pulse simulate --symbols 4 --events 1000 --producers 2 --capacity 1024 --seed 7 --chaos
+git clone https://github.com/owenHochwald/market-pulse.git && cd market-pulse
 ```
 
-Example output:
+Build:
 
-```text
-market-pulse simulation
-symbols=4 events=1000 producers=2 capacity=1024 chaos=on
-generated=1000 accepted=1000 consumed=1000 drops=0 producer_retries=86
-depth_current=0 depth_max=327
-p50_latency_ns=25 p95_latency_ns=1025 p99_latency_ns=1025
-halt_events=118 timestamp_skews=133 out_of_order_events=76 burst_storms=63
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ```
+
+Run a 5M-event multi-producer replay:
+
+```bash
+./build/market-pulse simulate --symbols 128 --events 5000000 --producers 2 --capacity 8388608 --seed 7
+```
+
+Run with exchange-style chaos enabled:
+
+```bash
+./build/market-pulse simulate --symbols 8 --events 10000 --producers 4 --capacity 4096 --seed 7 --chaos
+```
+
+## Test
+
+One command from the repo root:
+
+```bash
+cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on-failure
+```
+
+The suite validates:
+
+- Empty/full behavior, FIFO ordering, wraparound, and capacity validation.
+- Drop, depth, retry, and max-depth accounting.
+- Multi-producer event integrity.
+- Deterministic market replay counts.
+- Chaos-mode halt, skew, out-of-order, and burst-storm metrics.
+- CLI summary output.
 
 ## Architecture
 
 ```text
 synthetic feed producers
-  -> lock-free MPSC RingBuffer<MarketEvent>
-  -> single market-state consumer
-  -> latency, depth, drop, retry, and chaos metrics
+  -> lock-free RingBuffer<MarketEvent>
+  -> market-state consumer
+  -> latency, depth, retry, drop, and chaos metrics
 ```
 
-The ring buffer uses sequence-numbered slots and a CAS-reserved producer cursor.
-Consumers release slots by advancing their sequence numbers after reading. The
-capacity must be a power of two so slot lookup stays a mask operation instead of
-a modulo in the hot path.
+The ring buffer reserves producer slots with compare-and-swap, publishes events
+with per-slot sequence numbers, and uses power-of-two capacity so hot-path slot
+lookup is a mask operation. Normal replay retries on backpressure; chaos replay
+can intentionally drop events to model overloaded feeds.
 
-## What Is Tested
+## Requirements
 
-- Empty/full behavior, FIFO ordering, wraparound, and power-of-two capacity validation.
-- Drop, current-depth, max-depth, and producer CAS retry accounting.
-- Multi-producer integrity with unique event ranges.
-- Deterministic market replay counts.
-- Chaos-mode metrics for halts, timestamp skew, out-of-order events, and burst storms.
-- CLI summary formatting for generated, accepted, drop, and latency metrics.
-
-## Resume Framing
-
-- Built a C++20 lock-free MPSC market replay engine with sequence-numbered ring
-  slots, cache-line-separated atomics, and non-blocking producer semantics.
-- Added deterministic and chaos-mode exchange simulations with halt/resume
-  events, burst storms, timestamp skew, and out-of-order feed behavior.
-- Exposed latency percentiles, queue depth, drop counts, and producer CAS retry
-  metrics through a CLI service and red/green tested each behavioral slice.
+- C++20 compiler
+- CMake 3.20+
+- pthreads-compatible threading support
