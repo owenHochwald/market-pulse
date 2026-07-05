@@ -61,5 +61,6 @@ struct SimulationResult {
 int smoke_value();
 SimulationResult run_simulation(const SimulationConfig& config);
 std::string format_simulation_summary(const SimulationConfig& config, const SimulationResult& result);
+std::string format_html_report(const SimulationConfig& config, const SimulationResult& result);
 
 }  // namespace market_pulse

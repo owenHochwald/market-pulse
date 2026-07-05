@@ -218,6 +218,26 @@ void test_cli_summary_output() {
     expect(summary.find("p99_latency_ns=") != std::string::npos, "summary includes p99 latency");
 }
 
+void test_html_report_output() {
+    market_pulse::SimulationConfig config;
+    config.symbol_count = 2;
+    config.event_count = 16;
+    config.producer_count = 2;
+    config.capacity = 16;
+    config.chaos = true;
+
+    const auto result = market_pulse::run_simulation(config);
+    const std::string report = market_pulse::format_html_report(config, result);
+
+    expect(report.find("<!doctype html>") != std::string::npos, "html report has document type");
+    expect(report.find("market-pulse report") != std::string::npos, "html report has title");
+    expect(report.find("Run Summary") != std::string::npos, "html report includes run summary");
+    expect(report.find("Test Suite Coverage") != std::string::npos, "html report includes test coverage");
+    expect(report.find("Multi-producer event integrity") != std::string::npos,
+           "html report describes multi-producer tests");
+    expect(report.find("--events 16") != std::string::npos, "html report includes re-run command");
+}
+
 }  // namespace
 
 int main() {
@@ -229,6 +249,7 @@ int main() {
     test_market_simulation_determinism();
     test_chaos_mode_metrics();
     test_cli_summary_output();
+    test_html_report_output();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;

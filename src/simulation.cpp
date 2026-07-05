@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -61,6 +62,10 @@ std::uint64_t percentile(std::vector<std::uint64_t>& values, double quantile) {
     std::sort(values.begin(), values.end());
     const auto index = static_cast<std::size_t>((values.size() - 1) * quantile);
     return values[index];
+}
+
+std::string bool_label(bool value) {
+    return value ? "on" : "off";
 }
 
 }  // namespace
@@ -173,7 +178,7 @@ std::string format_simulation_summary(const SimulationConfig& config, const Simu
     output << "market-pulse simulation\n"
            << "symbols=" << config.symbol_count << " events=" << config.event_count
            << " producers=" << config.producer_count << " capacity=" << config.capacity
-           << " chaos=" << (config.chaos ? "on" : "off") << '\n'
+           << " chaos=" << bool_label(config.chaos) << '\n'
            << "generated=" << result.generated << " accepted=" << result.accepted
            << " consumed=" << result.consumed << " drops=" << result.ring.dropped
            << " producer_retries=" << result.ring.producer_retries << '\n'
@@ -186,6 +191,127 @@ std::string format_simulation_summary(const SimulationConfig& config, const Simu
            << " timestamp_skews=" << result.timestamp_skews
            << " out_of_order_events=" << result.out_of_order_events
            << " burst_storms=" << result.burst_storms << '\n';
+    return output.str();
+}
+
+std::string format_html_report(const SimulationConfig& config, const SimulationResult& result) {
+    const auto drop_rate = result.generated == 0
+                               ? 0.0
+                               : static_cast<double>(result.generated - result.accepted) * 100.0 /
+                                     static_cast<double>(result.generated);
+    const auto consume_rate = result.generated == 0
+                                  ? 0.0
+                                  : static_cast<double>(result.consumed) * 100.0 /
+                                        static_cast<double>(result.generated);
+
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(2)
+           << "<!doctype html>\n"
+           << "<html lang=\"en\">\n"
+           << "<head>\n"
+           << "  <meta charset=\"utf-8\">\n"
+           << "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+           << "  <title>market-pulse report</title>\n"
+           << "  <style>\n"
+           << "    :root { color-scheme: light; --ink:#18202a; --muted:#667085; --line:#d8dee8; --fill:#f5f7fa; --accent:#0f766e; --warn:#b45309; }\n"
+           << "    * { box-sizing: border-box; }\n"
+           << "    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif; color:var(--ink); background:#ffffff; }\n"
+           << "    main { max-width: 1040px; margin: 0 auto; padding: 40px 24px 56px; }\n"
+           << "    header { border-bottom: 1px solid var(--line); padding-bottom: 22px; margin-bottom: 24px; }\n"
+           << "    h1 { margin: 0 0 8px; font-size: clamp(2rem, 4vw, 3.4rem); line-height: 1; letter-spacing: 0; }\n"
+           << "    h2 { margin: 0 0 14px; font-size: 1.05rem; letter-spacing: 0; }\n"
+           << "    p { margin: 0; color: var(--muted); line-height: 1.55; }\n"
+           << "    section { margin-top: 28px; }\n"
+           << "    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }\n"
+           << "    .metric { border:1px solid var(--line); border-radius:8px; padding:16px; background:var(--fill); min-height: 94px; }\n"
+           << "    .metric strong { display:block; font-size:1.7rem; line-height:1.15; overflow-wrap:anywhere; }\n"
+           << "    .metric span { display:block; margin-top:6px; color:var(--muted); font-size:.9rem; }\n"
+           << "    .ok strong { color:var(--accent); }\n"
+           << "    .warn strong { color:var(--warn); }\n"
+           << "    table { width:100%; border-collapse: collapse; border:1px solid var(--line); border-radius:8px; overflow:hidden; display:table; }\n"
+           << "    th, td { padding:12px 14px; border-bottom:1px solid var(--line); text-align:left; font-size:.95rem; }\n"
+           << "    th { width:34%; background:var(--fill); color:var(--muted); font-weight:600; }\n"
+           << "    tr:last-child th, tr:last-child td { border-bottom:0; }\n"
+           << "    ul { margin:0; padding-left:20px; color:var(--ink); line-height:1.7; }\n"
+           << "    code { background:var(--fill); border:1px solid var(--line); border-radius:6px; padding:2px 6px; }\n"
+           << "    @media (max-width: 640px) { main { padding: 28px 16px 40px; } th, td { display:block; width:100%; } th { border-bottom:0; padding-bottom:4px; } td { padding-top:4px; } }\n"
+           << "  </style>\n"
+           << "</head>\n"
+           << "<body>\n"
+           << "  <main>\n"
+           << "    <header>\n"
+           << "      <h1>market-pulse report</h1>\n"
+           << "      <p>C++20 multi-producer market replay through a lock-free MPSC ring buffer.</p>\n"
+           << "    </header>\n"
+           << "    <section>\n"
+           << "      <h2>Run Summary</h2>\n"
+           << "      <div class=\"grid\">\n"
+           << "        <div class=\"metric ok\"><strong>" << result.generated << "</strong><span>events generated</span></div>\n"
+           << "        <div class=\"metric ok\"><strong>" << result.accepted << "</strong><span>events accepted</span></div>\n"
+           << "        <div class=\"metric ok\"><strong>" << result.consumed << "</strong><span>events consumed</span></div>\n"
+           << "        <div class=\"metric\"><strong>" << consume_rate << "%</strong><span>generated events consumed</span></div>\n"
+           << "      </div>\n"
+           << "    </section>\n"
+           << "    <section>\n"
+           << "      <h2>Latency</h2>\n"
+           << "      <div class=\"grid\">\n"
+           << "        <div class=\"metric\"><strong>" << result.p50_latency_ns << " ns</strong><span>p50 replay latency</span></div>\n"
+           << "        <div class=\"metric\"><strong>" << result.p95_latency_ns << " ns</strong><span>p95 replay latency</span></div>\n"
+           << "        <div class=\"metric\"><strong>" << result.p99_latency_ns << " ns</strong><span>p99 replay latency</span></div>\n"
+           << "      </div>\n"
+           << "    </section>\n"
+           << "    <section>\n"
+           << "      <h2>Backpressure</h2>\n"
+           << "      <div class=\"grid\">\n"
+           << "        <div class=\"metric" << (result.ring.dropped > 0 ? " warn" : "") << "\"><strong>" << result.ring.dropped << "</strong><span>failed push attempts / chaos drops</span></div>\n"
+           << "        <div class=\"metric\"><strong>" << result.ring.producer_retries << "</strong><span>producer CAS retries</span></div>\n"
+           << "        <div class=\"metric\"><strong>" << result.ring.max_depth << "</strong><span>max queue depth</span></div>\n"
+           << "        <div class=\"metric\"><strong>" << drop_rate << "%</strong><span>generated events not accepted</span></div>\n"
+           << "      </div>\n"
+           << "    </section>\n"
+           << "    <section>\n"
+           << "      <h2>Configuration</h2>\n"
+           << "      <table>\n"
+           << "        <tr><th>symbols</th><td>" << config.symbol_count << "</td></tr>\n"
+           << "        <tr><th>events</th><td>" << config.event_count << "</td></tr>\n"
+           << "        <tr><th>producers</th><td>" << config.producer_count << "</td></tr>\n"
+           << "        <tr><th>capacity</th><td>" << config.capacity << "</td></tr>\n"
+           << "        <tr><th>seed</th><td>" << config.seed << "</td></tr>\n"
+           << "        <tr><th>chaos mode</th><td>" << bool_label(config.chaos) << "</td></tr>\n"
+           << "      </table>\n"
+           << "    </section>\n"
+           << "    <section>\n"
+           << "      <h2>Chaos Signals</h2>\n"
+           << "      <div class=\"grid\">\n"
+           << "        <div class=\"metric\"><strong>" << result.halt_events << "</strong><span>halt/resume events</span></div>\n"
+           << "        <div class=\"metric\"><strong>" << result.timestamp_skews << "</strong><span>timestamp skews</span></div>\n"
+           << "        <div class=\"metric\"><strong>" << result.out_of_order_events << "</strong><span>out-of-order events</span></div>\n"
+           << "        <div class=\"metric\"><strong>" << result.burst_storms << "</strong><span>burst storms</span></div>\n"
+           << "      </div>\n"
+           << "    </section>\n"
+           << "    <section>\n"
+           << "      <h2>Test Suite Coverage</h2>\n"
+           << "      <ul>\n"
+           << "        <li>Ring buffer empty/full behavior, FIFO ordering, wraparound, and capacity validation.</li>\n"
+           << "        <li>Drop, current-depth, max-depth, and producer retry accounting.</li>\n"
+           << "        <li>Multi-producer event integrity with exactly-once delivery in the retry path.</li>\n"
+           << "        <li>Deterministic market replay counts and chaos-mode signal metrics.</li>\n"
+           << "        <li>CLI summary formatting for generated, accepted, drop, and latency metrics.</li>\n"
+           << "      </ul>\n"
+           << "    </section>\n"
+           << "    <section>\n"
+           << "      <h2>Re-run</h2>\n"
+           << "      <p><code>market-pulse simulate --symbols " << config.symbol_count
+           << " --events " << config.event_count
+           << " --producers " << config.producer_count
+           << " --capacity " << config.capacity
+           << " --seed " << config.seed
+           << (config.chaos ? " --chaos" : "")
+           << "</code></p>\n"
+           << "    </section>\n"
+           << "  </main>\n"
+           << "</body>\n"
+           << "</html>\n";
     return output.str();
 }
 
