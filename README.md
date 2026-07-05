@@ -19,8 +19,9 @@ that can push a 5,000,000-event multi-producer replay in a release build.
   out-of-order feed behavior.
 - CLI metrics for accepted/consumed events, queue depth, retries, drops, and
   p50/p95/p99 replay latency.
+- Generated HTML report with run metrics and a concise test-suite coverage view.
 - Self-contained CTest suite covering ring-buffer behavior, concurrency,
-  deterministic replay, chaos metrics, and CLI formatting.
+  deterministic replay, chaos metrics, and CLI/report formatting.
 
 ## Quick Start
 
@@ -36,11 +37,29 @@ Build:
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ```
 
+See every CLI option:
+
+```bash
+./build/market-pulse --help
+```
+
 Run a 5M-event multi-producer replay:
 
 ```bash
 ./build/market-pulse simulate --symbols 128 --events 5000000 --producers 2 --capacity 8388608 --seed 7
 ```
+
+Each simulation prints a terminal summary and writes a local HTML report:
+
+```text
+html_report="/path/to/market-pulse-report.html"
+html_report_url=file:///path/to/market-pulse-report.html
+```
+
+Open the `file://` URL in a browser to view a lightweight dashboard with run
+metrics, latency, backpressure, chaos signals, and test-suite coverage. Use
+`--report reports/run.html` to choose a path, or `--no-report` to skip HTML
+generation.
 
 Run with exchange-style chaos enabled:
 
@@ -63,7 +82,7 @@ The suite validates:
 - Multi-producer event integrity.
 - Deterministic market replay counts.
 - Chaos-mode halt, skew, out-of-order, and burst-storm metrics.
-- CLI summary output.
+- CLI summary and HTML report output.
 
 ## Architecture
 
