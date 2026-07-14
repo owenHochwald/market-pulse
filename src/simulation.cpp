@@ -1,317 +1,518 @@
 #include "market_pulse/simulation.hpp"
 
-#include <atomic>
+#include "market_pulse/platform.hpp"
+
 #include <algorithm>
+#include <atomic>
+#include <barrier>
+#include <chrono>
 #include <iomanip>
+#include <limits>
+#include <memory>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <vector>
 
 namespace market_pulse {
-
-int smoke_value() {
-    return 42;
-}
-
 namespace {
 
-MarketEvent make_event(const SimulationConfig& config, std::uint64_t event_id) {
-    const auto symbol_count = static_cast<std::uint64_t>(config.symbol_count);
-    const auto symbol_id = static_cast<std::uint32_t>(event_id % symbol_count);
-    const auto base_price = 100'000'000 + static_cast<std::int64_t>(symbol_id) * 1'000'000;
-    auto event_type = event_id % 3 == 0 ? EventType::Trade : EventType::Quote;
-    auto exchange_timestamp = config.seed * 1'000'000 + event_id * 100;
-    auto receive_timestamp = exchange_timestamp + 25;
+struct QueuedEvent {
+    MarketEvent event;
+    std::uint64_t enqueue_timestamp = 0;
+};
 
-    if (config.chaos) {
-        if (event_id % 17 == 0) {
-            event_type = EventType::Halt;
-        } else if (event_id % 17 == 4) {
-            event_type = EventType::Resume;
-        } else if (event_id % 11 == 0) {
-            event_type = EventType::Heartbeat;
-        }
+struct ProducerMetrics {
+    std::uint64_t generated = 0;
+    std::uint64_t halt_events = 0;
+    std::uint64_t timestamp_skews = 0;
+    std::uint64_t out_of_order_events = 0;
+    std::uint64_t burst_storms = 0;
+};
 
-        if (event_id % 7 == 0) {
-            receive_timestamp = exchange_timestamp > 250 ? exchange_timestamp - 250 : 0;
-        }
-
-        if (event_id % 13 == 0 && event_id > 0) {
-            exchange_timestamp -= 1'000;
+class EventCursor {
+public:
+    EventCursor(const SimulationConfig& config, std::size_t lane) : config_(config) {
+        for (std::size_t symbol = lane; symbol < config.symbol_count; symbol += config.producer_count) {
+            symbols_.push_back(symbol);
         }
     }
 
-    return MarketEvent{
-        event_id,
-        symbol_id,
-        event_type,
-        event_id % 2 == 0 ? Side::Bid : Side::Ask,
-        exchange_timestamp,
-        receive_timestamp,
-        base_price + static_cast<std::int64_t>((event_id % 17) * 100),
-        static_cast<std::uint32_t>(100 + (event_id % 50)),
-    };
+    bool next(MarketEvent& event) {
+        while (symbol_index_ < symbols_.size()) {
+            const auto symbol = symbols_[symbol_index_];
+            const auto event_id = symbol + round_ * config_.symbol_count;
+            advance();
+            if (event_id < config_.event_count) {
+                event = make(event_id, static_cast<std::uint32_t>(symbol));
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    void advance() {
+        ++symbol_index_;
+        if (symbol_index_ == symbols_.size()) {
+            symbol_index_ = 0;
+            ++round_;
+            if (!symbols_.empty() && symbols_.front() + round_ * config_.symbol_count >= config_.event_count) {
+                symbol_index_ = symbols_.size();
+            }
+        }
+    }
+
+    MarketEvent make(std::uint64_t event_id, std::uint32_t symbol_id) const {
+        const auto base_price = 100'000'000 + static_cast<std::int64_t>(symbol_id) * 1'000'000;
+        auto event_type = event_id % 3 == 0 ? EventType::Trade : EventType::Quote;
+        auto exchange_timestamp = config_.seed * 1'000'000 + event_id * 100;
+        auto receive_timestamp = exchange_timestamp + 25;
+
+        if (config_.chaos) {
+            if (event_id % 17 == 0) {
+                event_type = EventType::Halt;
+            } else if (event_id % 17 == 4) {
+                event_type = EventType::Resume;
+            } else if (event_id % 11 == 0) {
+                event_type = EventType::Heartbeat;
+            }
+            if (event_id % 7 == 0) {
+                receive_timestamp = exchange_timestamp > 250 ? exchange_timestamp - 250 : 0;
+            }
+            if (event_id % 13 == 0 && event_id > 0) {
+                exchange_timestamp -= 1'000;
+            }
+        }
+
+        return {
+            event_id,
+            symbol_id,
+            event_type,
+            event_id % 2 == 0 ? Side::Bid : Side::Ask,
+            exchange_timestamp,
+            receive_timestamp,
+            base_price + static_cast<std::int64_t>((event_id % 17) * 100),
+            static_cast<std::uint32_t>(100 + (event_id % 50)),
+        };
+    }
+
+    const SimulationConfig& config_;
+    std::vector<std::size_t> symbols_;
+    std::size_t symbol_index_ = 0;
+    std::uint64_t round_ = 0;
+};
+
+void record_generated(const SimulationConfig& config, const MarketEvent& event,
+                      ProducerMetrics& metrics) noexcept {
+    ++metrics.generated;
+    if (event.type == EventType::Halt || event.type == EventType::Resume) {
+        ++metrics.halt_events;
+    }
+    if (event.receive_timestamp_ns < event.exchange_timestamp_ns) {
+        ++metrics.timestamp_skews;
+    }
+    if (config.chaos && event.event_id % 13 == 0 && event.event_id > 0) {
+        ++metrics.out_of_order_events;
+    }
+    if (config.chaos && event.event_id % 16 == 0) {
+        ++metrics.burst_storms;
+    }
 }
 
-std::uint64_t percentile(std::vector<std::uint64_t>& values, double quantile) {
-    if (values.empty()) {
+void apply_event(const MarketEvent& event, TopOfBook& book) noexcept {
+    switch (event.type) {
+        case EventType::Quote:
+            if (event.side == Side::Bid) {
+                book.bid_price_micros = event.price_micros;
+                book.bid_size = event.size;
+            } else if (event.side == Side::Ask) {
+                book.ask_price_micros = event.price_micros;
+                book.ask_size = event.size;
+            }
+            break;
+        case EventType::Trade:
+            book.last_trade_price_micros = event.price_micros;
+            book.traded_volume += event.size;
+            ++book.trade_count;
+            break;
+        case EventType::Halt:
+            book.halted = true;
+            break;
+        case EventType::Resume:
+            book.halted = false;
+            break;
+        case EventType::Heartbeat:
+            break;
+    }
+}
+
+std::uint64_t hash_value(std::uint64_t hash, std::uint64_t value) noexcept {
+    constexpr std::uint64_t prime = 1099511628211ULL;
+    for (int byte = 0; byte < 8; ++byte) {
+        hash ^= (value >> (byte * 8)) & 0xffU;
+        hash *= prime;
+    }
+    return hash;
+}
+
+std::uint64_t state_checksum(const std::vector<TopOfBook>& books) noexcept {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (const auto& book : books) {
+        hash = hash_value(hash, static_cast<std::uint64_t>(book.bid_price_micros));
+        hash = hash_value(hash, static_cast<std::uint64_t>(book.ask_price_micros));
+        hash = hash_value(hash, static_cast<std::uint64_t>(book.last_trade_price_micros));
+        hash = hash_value(hash, book.traded_volume);
+        hash = hash_value(hash, book.trade_count);
+        hash = hash_value(hash, book.bid_size);
+        hash = hash_value(hash, book.ask_size);
+        hash = hash_value(hash, book.halted ? 1 : 0);
+    }
+    return hash;
+}
+
+std::uint64_t quantile(const std::vector<std::uint64_t>& sorted, double value) noexcept {
+    if (sorted.empty()) {
         return 0;
     }
-
-    std::sort(values.begin(), values.end());
-    const auto index = static_cast<std::size_t>((values.size() - 1) * quantile);
-    return values[index];
+    const auto index = static_cast<std::size_t>((sorted.size() - 1) * value);
+    return sorted[index];
 }
 
-std::string bool_label(bool value) {
-    return value ? "on" : "off";
+LaneStats aggregate_lanes(const std::vector<LaneStats>& lanes) noexcept {
+    LaneStats total;
+    for (const auto& lane : lanes) {
+        total.pushed += lane.pushed;
+        total.popped += lane.popped;
+        total.dropped += lane.dropped;
+        total.full_observations += lane.full_observations;
+        total.spin_iterations += lane.spin_iterations;
+        total.current_depth += lane.current_depth;
+        total.max_depth = std::max(total.max_depth, lane.max_depth);
+    }
+    return total;
 }
+
+std::string profile_label(BenchmarkProfile profile) {
+    switch (profile) {
+        case BenchmarkProfile::Throughput: return "throughput";
+        case BenchmarkProfile::Latency: return "latency";
+        case BenchmarkProfile::Balanced: return "balanced";
+    }
+    return "unknown";
+}
+
+SimulationConfig configured_profile(const BenchmarkConfig& config) {
+    auto simulation = config.simulation;
+    switch (config.profile) {
+        case BenchmarkProfile::Throughput:
+            if (!config.override_capacity) simulation.capacity = 65536;
+            if (!config.override_batch) simulation.consumer_batch = 8192;
+            if (!config.override_sample_rate) simulation.latency_sample_rate = 0;
+            break;
+        case BenchmarkProfile::Latency:
+            if (!config.override_capacity) simulation.capacity = 64;
+            if (!config.override_batch) simulation.consumer_batch = 1;
+            if (!config.override_sample_rate) simulation.latency_sample_rate = 64;
+            break;
+        case BenchmarkProfile::Balanced:
+            if (!config.override_capacity) simulation.capacity = 1024;
+            if (!config.override_batch) simulation.consumer_batch = 16;
+            if (!config.override_sample_rate) simulation.latency_sample_rate = 64;
+            break;
+    }
+    return simulation;
+}
+
+std::string bool_label(bool value) { return value ? "on" : "off"; }
 
 }  // namespace
 
 SimulationResult run_simulation(const SimulationConfig& config) {
-    if (config.symbol_count == 0) {
-        throw std::invalid_argument("symbol_count must be greater than zero");
+    if (config.symbol_count == 0 || config.producer_count == 0 || config.event_count == 0) {
+        throw std::invalid_argument("symbols, producers, and events must be greater than zero");
     }
-    if (config.producer_count == 0) {
-        throw std::invalid_argument("producer_count must be greater than zero");
+    if (config.producer_count > config.symbol_count) {
+        throw std::invalid_argument("producer_count cannot exceed symbol_count");
+    }
+    if (config.consumer_batch == 0) {
+        throw std::invalid_argument("consumer_batch must be greater than zero");
+    }
+    if (!config.cpu_ids.empty() && config.cpu_ids.size() < config.producer_count + 1) {
+        throw std::invalid_argument("CPU list must contain the consumer CPU followed by every producer CPU");
     }
 
-    RingBuffer<MarketEvent> ring(config.capacity);
-    std::atomic<std::uint64_t> generated{0};
-    std::atomic<std::uint64_t> accepted{0};
-    std::atomic<std::uint64_t> consumed{0};
-    std::atomic<std::uint64_t> halt_events{0};
-    std::atomic<std::uint64_t> timestamp_skews{0};
-    std::atomic<std::uint64_t> out_of_order_events{0};
-    std::atomic<std::uint64_t> burst_storms{0};
-    std::atomic<bool> producers_done{false};
+    MonotonicClock clock;
+    std::vector<std::unique_ptr<SpscRing<QueuedEvent>>> lanes;
+    lanes.reserve(config.producer_count);
+    for (std::size_t lane = 0; lane < config.producer_count; ++lane) {
+        lanes.push_back(std::make_unique<SpscRing<QueuedEvent>>(config.capacity));
+    }
+    const bool huge_pages_advised = config.huge_pages &&
+        std::all_of(lanes.begin(), lanes.end(), [](const auto& lane) { return lane->advise_huge_pages(); });
+
+    auto done = std::make_unique<std::atomic<bool>[]>(config.producer_count);
+    std::vector<ProducerMetrics> producer_metrics(config.producer_count);
+    std::vector<std::uint8_t> affinity_results(config.producer_count + 1, 0);
+    auto cpu_ids = config.cpu_ids.empty() ? available_cpu_ids() : config.cpu_ids;
+    std::barrier start_barrier(static_cast<std::ptrdiff_t>(config.producer_count + 2));
     std::vector<std::uint64_t> per_symbol_counts(config.symbol_count, 0);
+    std::vector<TopOfBook> books(config.symbol_count);
     std::vector<std::uint64_t> latencies;
-    latencies.reserve(config.event_count);
+    if (config.latency_sample_rate != 0) {
+        latencies.reserve(config.event_count / config.latency_sample_rate + config.producer_count);
+    }
 
     std::thread consumer([&] {
-        MarketEvent event;
-        while (!producers_done.load(std::memory_order_acquire) ||
-               consumed.load(std::memory_order_relaxed) < accepted.load(std::memory_order_relaxed)) {
-            if (!ring.try_pop(event)) {
-                std::this_thread::yield();
-                continue;
+        if (config.pin_threads && !cpu_ids.empty()) {
+            affinity_results[0] = pin_current_thread(cpu_ids[0]) ? 1 : 0;
+        }
+        start_barrier.arrive_and_wait();
+
+        for (;;) {
+            bool made_progress = false;
+            for (std::size_t lane_index = 0; lane_index < lanes.size(); ++lane_index) {
+                auto span = lanes[lane_index]->reserve_read(config.consumer_batch);
+                if (!span) {
+                    continue;
+                }
+                made_progress = true;
+                for (std::size_t index = 0; index < span.size; ++index) {
+                    const auto& queued = span.data[index];
+                    const auto& event = queued.event;
+                    ++per_symbol_counts[event.symbol_id];
+                    apply_event(event, books[event.symbol_id]);
+                    if (queued.enqueue_timestamp != 0) {
+                        const auto received = clock.consumer_timestamp();
+                        if (received >= queued.enqueue_timestamp) {
+                            latencies.push_back(clock.to_nanoseconds(received - queued.enqueue_timestamp));
+                        }
+                    }
+                }
+                lanes[lane_index]->commit_read(span.size);
             }
 
-            if (event.symbol_id < per_symbol_counts.size()) {
-                ++per_symbol_counts[event.symbol_id];
+            if (made_progress) {
+                continue;
             }
-            const auto latency = event.receive_timestamp_ns >= event.exchange_timestamp_ns
-                                     ? event.receive_timestamp_ns - event.exchange_timestamp_ns
-                                     : 0;
-            latencies.push_back(latency);
-            consumed.fetch_add(1, std::memory_order_relaxed);
+            bool all_done = true;
+            for (std::size_t lane = 0; lane < config.producer_count; ++lane) {
+                all_done &= done[lane].load(std::memory_order_acquire);
+            }
+            if (all_done) {
+                bool any_remaining = false;
+                for (auto& lane : lanes) {
+                    if (lane->reserve_read(1)) {
+                        any_remaining = true;
+                        break;
+                    }
+                }
+                if (!any_remaining) {
+                    break;
+                }
+                continue;
+            }
+            cpu_relax();
         }
     });
 
     std::vector<std::thread> producers;
     producers.reserve(config.producer_count);
-    for (std::size_t producer = 0; producer < config.producer_count; ++producer) {
-        producers.emplace_back([&, producer] {
-            for (std::uint64_t event_id = producer; event_id < config.event_count;
-                 event_id += config.producer_count) {
-                auto event = make_event(config, event_id);
-
-                generated.fetch_add(1, std::memory_order_relaxed);
-                if (event.type == EventType::Halt || event.type == EventType::Resume) {
-                    halt_events.fetch_add(1, std::memory_order_relaxed);
-                }
-                if (event.receive_timestamp_ns < event.exchange_timestamp_ns) {
-                    timestamp_skews.fetch_add(1, std::memory_order_relaxed);
-                }
-                if (config.chaos && event_id % 13 == 0 && event_id > 0) {
-                    out_of_order_events.fetch_add(1, std::memory_order_relaxed);
-                }
-                if (config.chaos && event_id % 16 == 0) {
-                    burst_storms.fetch_add(1, std::memory_order_relaxed);
-                }
-
-                if (config.chaos) {
-                    if (ring.try_push(event)) {
-                        accepted.fetch_add(1, std::memory_order_relaxed);
-                    }
-                } else {
-                    while (!ring.try_push(event)) {
-                        std::this_thread::yield();
-                    }
-                    accepted.fetch_add(1, std::memory_order_relaxed);
-                }
+    for (std::size_t lane_index = 0; lane_index < config.producer_count; ++lane_index) {
+        producers.emplace_back([&, lane_index] {
+            if (config.pin_threads && cpu_ids.size() > lane_index + 1) {
+                affinity_results[lane_index + 1] = pin_current_thread(cpu_ids[lane_index + 1]) ? 1 : 0;
             }
+            EventCursor cursor(config, lane_index);
+            ProducerMetrics local_metrics;
+            MarketEvent pending;
+            bool has_pending = cursor.next(pending);
+            start_barrier.arrive_and_wait();
+
+            while (has_pending) {
+                auto span = lanes[lane_index]->reserve_write(config.consumer_batch);
+                if (!span) {
+                    if (config.backpressure == BackpressurePolicy::Drop) {
+                        record_generated(config, pending, local_metrics);
+                        lanes[lane_index]->note_drop();
+                        has_pending = cursor.next(pending);
+                    } else {
+                        lanes[lane_index]->note_spin();
+                        cpu_relax();
+                    }
+                    continue;
+                }
+
+                std::size_t produced = 0;
+                while (produced < span.size && has_pending) {
+                    record_generated(config, pending, local_metrics);
+                    span.data[produced].event = pending;
+                    span.data[produced].enqueue_timestamp =
+                        config.latency_sample_rate != 0 && pending.event_id % config.latency_sample_rate == 0
+                            ? clock.producer_timestamp()
+                            : 0;
+                    ++produced;
+                    has_pending = cursor.next(pending);
+                }
+                lanes[lane_index]->commit_write(produced);
+            }
+            producer_metrics[lane_index] = local_metrics;
+            done[lane_index].store(true, std::memory_order_release);
         });
     }
 
+    const auto started = std::chrono::steady_clock::now();
+    start_barrier.arrive_and_wait();
     for (auto& producer : producers) {
         producer.join();
     }
-    producers_done.store(true, std::memory_order_release);
     consumer.join();
+    const auto stopped = std::chrono::steady_clock::now();
 
-    auto p50_values = latencies;
-    auto p95_values = latencies;
-    auto p99_values = latencies;
+    SimulationResult result;
+    result.elapsed_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(stopped - started).count());
+    result.per_symbol_counts = std::move(per_symbol_counts);
+    result.books = std::move(books);
+    result.state_checksum = state_checksum(result.books);
+    result.used_invariant_tsc = clock.uses_invariant_tsc();
+    result.affinity_applied = config.pin_threads &&
+        std::all_of(affinity_results.begin(), affinity_results.end(), [](std::uint8_t value) { return value != 0; });
+    result.huge_pages_advised = huge_pages_advised;
 
-    return SimulationResult{
-        generated.load(std::memory_order_relaxed),
-        accepted.load(std::memory_order_relaxed),
-        consumed.load(std::memory_order_relaxed),
-        halt_events.load(std::memory_order_relaxed),
-        timestamp_skews.load(std::memory_order_relaxed),
-        out_of_order_events.load(std::memory_order_relaxed),
-        burst_storms.load(std::memory_order_relaxed),
-        percentile(p50_values, 0.50),
-        percentile(p95_values, 0.95),
-        percentile(p99_values, 0.99),
-        per_symbol_counts,
-        ring.stats(),
-    };
+    for (std::size_t lane = 0; lane < lanes.size(); ++lane) {
+        result.generated += producer_metrics[lane].generated;
+        result.halt_events += producer_metrics[lane].halt_events;
+        result.timestamp_skews += producer_metrics[lane].timestamp_skews;
+        result.out_of_order_events += producer_metrics[lane].out_of_order_events;
+        result.burst_storms += producer_metrics[lane].burst_storms;
+        result.lanes.push_back(lanes[lane]->stats());
+    }
+    result.ring = aggregate_lanes(result.lanes);
+    result.accepted = result.ring.pushed;
+    result.consumed = result.ring.popped;
+    result.events_per_second = result.elapsed_ns == 0 ? 0.0 :
+        static_cast<double>(result.consumed) * 1'000'000'000.0 / static_cast<double>(result.elapsed_ns);
+
+    std::sort(latencies.begin(), latencies.end());
+    result.p50_latency_ns = quantile(latencies, 0.50);
+    result.p95_latency_ns = quantile(latencies, 0.95);
+    result.p99_latency_ns = quantile(latencies, 0.99);
+    result.p999_latency_ns = quantile(latencies, 0.999);
+    result.max_latency_ns = latencies.empty() ? 0 : latencies.back();
+    return result;
+}
+
+BenchmarkResult run_benchmark(const BenchmarkConfig& config) {
+    if (config.repeats == 0) {
+        throw std::invalid_argument("benchmark repeats must be greater than zero");
+    }
+    auto simulation = configured_profile(config);
+    if (config.warmup_events != 0) {
+        auto warmup = simulation;
+        warmup.event_count = config.warmup_events;
+        warmup.latency_sample_rate = 0;
+        (void)run_simulation(warmup);
+    }
+
+    BenchmarkResult result;
+    result.profile = config.profile;
+    result.runs.reserve(config.repeats);
+    for (std::size_t repeat = 0; repeat < config.repeats; ++repeat) {
+        result.runs.push_back(run_simulation(simulation));
+    }
+    std::vector<std::size_t> order(result.runs.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](std::size_t left, std::size_t right) {
+        return result.runs[left].events_per_second < result.runs[right].events_per_second;
+    });
+    result.median = result.runs[order[order.size() / 2]];
+    return result;
 }
 
 std::string format_simulation_summary(const SimulationConfig& config, const SimulationResult& result) {
     std::ostringstream output;
-    output << "market-pulse simulation\n"
+    output << std::fixed << std::setprecision(2)
+           << "market-pulse simulation\n"
            << "symbols=" << config.symbol_count << " events=" << config.event_count
-           << " producers=" << config.producer_count << " capacity=" << config.capacity
-           << " chaos=" << bool_label(config.chaos) << '\n'
+           << " producers=" << config.producer_count << " lane_capacity=" << config.capacity
+           << " batch=" << config.consumer_batch << " chaos=" << bool_label(config.chaos) << '\n'
            << "generated=" << result.generated << " accepted=" << result.accepted
            << " consumed=" << result.consumed << " drops=" << result.ring.dropped
-           << " producer_retries=" << result.ring.producer_retries << '\n'
-           << "depth_current=" << result.ring.current_depth
-           << " depth_max=" << result.ring.max_depth << '\n'
-           << "p50_latency_ns=" << result.p50_latency_ns
-           << " p95_latency_ns=" << result.p95_latency_ns
-           << " p99_latency_ns=" << result.p99_latency_ns << '\n'
-           << "halt_events=" << result.halt_events
-           << " timestamp_skews=" << result.timestamp_skews
-           << " out_of_order_events=" << result.out_of_order_events
-           << " burst_storms=" << result.burst_storms << '\n';
+           << " full_observations=" << result.ring.full_observations
+           << " spins=" << result.ring.spin_iterations << '\n'
+           << "depth_current=" << result.ring.current_depth << " depth_max=" << result.ring.max_depth << '\n'
+           << "elapsed_ns=" << result.elapsed_ns << " events_per_second=" << result.events_per_second << '\n'
+           << "p50_handoff_ns=" << result.p50_latency_ns << " p95_handoff_ns=" << result.p95_latency_ns
+           << " p99_handoff_ns=" << result.p99_latency_ns << " p999_handoff_ns=" << result.p999_latency_ns
+           << " max_handoff_ns=" << result.max_latency_ns << '\n'
+           << "state_checksum=" << result.state_checksum << " invariant_tsc=" << bool_label(result.used_invariant_tsc)
+           << " affinity=" << bool_label(result.affinity_applied)
+           << " huge_pages=" << bool_label(result.huge_pages_advised) << '\n'
+           << "halt_events=" << result.halt_events << " timestamp_skews=" << result.timestamp_skews
+           << " out_of_order_events=" << result.out_of_order_events << " burst_storms=" << result.burst_storms << '\n';
+    return output.str();
+}
+
+std::string format_benchmark_summary(const BenchmarkConfig& config, const BenchmarkResult& result) {
+    auto simulation = configured_profile(config);
+    std::ostringstream output;
+    output << "market-pulse benchmark\nprofile=" << profile_label(config.profile)
+           << " repeats=" << config.repeats << " warmup_events=" << config.warmup_events << '\n'
+           << format_simulation_summary(simulation, result.median);
+    return output.str();
+}
+
+std::string format_benchmark_json(const BenchmarkConfig& config, const BenchmarkResult& result) {
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(2)
+           << "{\n  \"profile\": \"" << profile_label(config.profile) << "\",\n"
+           << "  \"repeats\": " << config.repeats << ",\n"
+           << "  \"events_per_second\": " << result.median.events_per_second << ",\n"
+           << "  \"elapsed_ns\": " << result.median.elapsed_ns << ",\n"
+           << "  \"p50_handoff_ns\": " << result.median.p50_latency_ns << ",\n"
+           << "  \"p99_handoff_ns\": " << result.median.p99_latency_ns << ",\n"
+           << "  \"p999_handoff_ns\": " << result.median.p999_latency_ns << ",\n"
+           << "  \"max_handoff_ns\": " << result.median.max_latency_ns << ",\n"
+           << "  \"drops\": " << result.median.ring.dropped << ",\n"
+           << "  \"state_checksum\": \"" << result.median.state_checksum << "\"\n}\n";
     return output.str();
 }
 
 std::string format_html_report(const SimulationConfig& config, const SimulationResult& result) {
-    const auto drop_rate = result.generated == 0
-                               ? 0.0
-                               : static_cast<double>(result.generated - result.accepted) * 100.0 /
-                                     static_cast<double>(result.generated);
-    const auto consume_rate = result.generated == 0
-                                  ? 0.0
-                                  : static_cast<double>(result.consumed) * 100.0 /
-                                        static_cast<double>(result.generated);
-
     std::ostringstream output;
     output << std::fixed << std::setprecision(2)
-           << "<!doctype html>\n"
-           << "<html lang=\"en\">\n"
-           << "<head>\n"
-           << "  <meta charset=\"utf-8\">\n"
-           << "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-           << "  <title>market-pulse report</title>\n"
-           << "  <style>\n"
-           << "    :root { color-scheme: light; --ink:#18202a; --muted:#667085; --line:#d8dee8; --fill:#f5f7fa; --accent:#0f766e; --warn:#b45309; }\n"
-           << "    * { box-sizing: border-box; }\n"
-           << "    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif; color:var(--ink); background:#ffffff; }\n"
-           << "    main { max-width: 1040px; margin: 0 auto; padding: 40px 24px 56px; }\n"
-           << "    header { border-bottom: 1px solid var(--line); padding-bottom: 22px; margin-bottom: 24px; }\n"
-           << "    h1 { margin: 0 0 8px; font-size: clamp(2rem, 4vw, 3.4rem); line-height: 1; letter-spacing: 0; }\n"
-           << "    h2 { margin: 0 0 14px; font-size: 1.05rem; letter-spacing: 0; }\n"
-           << "    p { margin: 0; color: var(--muted); line-height: 1.55; }\n"
-           << "    section { margin-top: 28px; }\n"
-           << "    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }\n"
-           << "    .metric { border:1px solid var(--line); border-radius:8px; padding:16px; background:var(--fill); min-height: 94px; }\n"
-           << "    .metric strong { display:block; font-size:1.7rem; line-height:1.15; overflow-wrap:anywhere; }\n"
-           << "    .metric span { display:block; margin-top:6px; color:var(--muted); font-size:.9rem; }\n"
-           << "    .ok strong { color:var(--accent); }\n"
-           << "    .warn strong { color:var(--warn); }\n"
-           << "    table { width:100%; border-collapse: collapse; border:1px solid var(--line); border-radius:8px; overflow:hidden; display:table; }\n"
-           << "    th, td { padding:12px 14px; border-bottom:1px solid var(--line); text-align:left; font-size:.95rem; }\n"
-           << "    th { width:34%; background:var(--fill); color:var(--muted); font-weight:600; }\n"
-           << "    tr:last-child th, tr:last-child td { border-bottom:0; }\n"
-           << "    ul { margin:0; padding-left:20px; color:var(--ink); line-height:1.7; }\n"
-           << "    code { background:var(--fill); border:1px solid var(--line); border-radius:6px; padding:2px 6px; }\n"
-           << "    @media (max-width: 640px) { main { padding: 28px 16px 40px; } th, td { display:block; width:100%; } th { border-bottom:0; padding-bottom:4px; } td { padding-top:4px; } }\n"
-           << "  </style>\n"
-           << "</head>\n"
-           << "<body>\n"
-           << "  <main>\n"
-           << "    <header>\n"
-           << "      <h1>market-pulse report</h1>\n"
-           << "      <p>C++20 multi-producer market replay through a lock-free MPSC ring buffer.</p>\n"
-           << "    </header>\n"
-           << "    <section>\n"
-           << "      <h2>Run Summary</h2>\n"
-           << "      <div class=\"grid\">\n"
-           << "        <div class=\"metric ok\"><strong>" << result.generated << "</strong><span>events generated</span></div>\n"
-           << "        <div class=\"metric ok\"><strong>" << result.accepted << "</strong><span>events accepted</span></div>\n"
-           << "        <div class=\"metric ok\"><strong>" << result.consumed << "</strong><span>events consumed</span></div>\n"
-           << "        <div class=\"metric\"><strong>" << consume_rate << "%</strong><span>generated events consumed</span></div>\n"
-           << "      </div>\n"
-           << "    </section>\n"
-           << "    <section>\n"
-           << "      <h2>Latency</h2>\n"
-           << "      <div class=\"grid\">\n"
-           << "        <div class=\"metric\"><strong>" << result.p50_latency_ns << " ns</strong><span>p50 replay latency</span></div>\n"
-           << "        <div class=\"metric\"><strong>" << result.p95_latency_ns << " ns</strong><span>p95 replay latency</span></div>\n"
-           << "        <div class=\"metric\"><strong>" << result.p99_latency_ns << " ns</strong><span>p99 replay latency</span></div>\n"
-           << "      </div>\n"
-           << "    </section>\n"
-           << "    <section>\n"
-           << "      <h2>Backpressure</h2>\n"
-           << "      <div class=\"grid\">\n"
-           << "        <div class=\"metric" << (result.ring.dropped > 0 ? " warn" : "") << "\"><strong>" << result.ring.dropped << "</strong><span>failed push attempts / chaos drops</span></div>\n"
-           << "        <div class=\"metric\"><strong>" << result.ring.producer_retries << "</strong><span>producer CAS retries</span></div>\n"
-           << "        <div class=\"metric\"><strong>" << result.ring.max_depth << "</strong><span>max queue depth</span></div>\n"
-           << "        <div class=\"metric\"><strong>" << drop_rate << "%</strong><span>generated events not accepted</span></div>\n"
-           << "      </div>\n"
-           << "    </section>\n"
-           << "    <section>\n"
-           << "      <h2>Configuration</h2>\n"
-           << "      <table>\n"
-           << "        <tr><th>symbols</th><td>" << config.symbol_count << "</td></tr>\n"
-           << "        <tr><th>events</th><td>" << config.event_count << "</td></tr>\n"
-           << "        <tr><th>producers</th><td>" << config.producer_count << "</td></tr>\n"
-           << "        <tr><th>capacity</th><td>" << config.capacity << "</td></tr>\n"
-           << "        <tr><th>seed</th><td>" << config.seed << "</td></tr>\n"
-           << "        <tr><th>chaos mode</th><td>" << bool_label(config.chaos) << "</td></tr>\n"
-           << "      </table>\n"
-           << "    </section>\n"
-           << "    <section>\n"
-           << "      <h2>Chaos Signals</h2>\n"
-           << "      <div class=\"grid\">\n"
-           << "        <div class=\"metric\"><strong>" << result.halt_events << "</strong><span>halt/resume events</span></div>\n"
-           << "        <div class=\"metric\"><strong>" << result.timestamp_skews << "</strong><span>timestamp skews</span></div>\n"
-           << "        <div class=\"metric\"><strong>" << result.out_of_order_events << "</strong><span>out-of-order events</span></div>\n"
-           << "        <div class=\"metric\"><strong>" << result.burst_storms << "</strong><span>burst storms</span></div>\n"
-           << "      </div>\n"
-           << "    </section>\n"
-           << "    <section>\n"
-           << "      <h2>Test Suite Coverage</h2>\n"
-           << "      <ul>\n"
-           << "        <li>Ring buffer empty/full behavior, FIFO ordering, wraparound, and capacity validation.</li>\n"
-           << "        <li>Drop, current-depth, max-depth, and producer retry accounting.</li>\n"
-           << "        <li>Multi-producer event integrity with exactly-once delivery in the retry path.</li>\n"
-           << "        <li>Deterministic market replay counts and chaos-mode signal metrics.</li>\n"
-           << "        <li>CLI summary formatting for generated, accepted, drop, and latency metrics.</li>\n"
-           << "      </ul>\n"
-           << "    </section>\n"
-           << "    <section>\n"
-           << "      <h2>Re-run</h2>\n"
-           << "      <p><code>market-pulse simulate --symbols " << config.symbol_count
-           << " --events " << config.event_count
-           << " --producers " << config.producer_count
-           << " --capacity " << config.capacity
-           << " --seed " << config.seed
-           << (config.chaos ? " --chaos" : "")
-           << "</code></p>\n"
-           << "    </section>\n"
-           << "  </main>\n"
-           << "</body>\n"
-           << "</html>\n";
+           << "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
+           << "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+           << "<title>market-pulse report</title><style>"
+           << "body{font:15px system-ui;margin:0;color:#17202a}main{max-width:960px;margin:auto;padding:32px 20px}"
+           << "h1{font-size:32px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}"
+           << ".metric{border:1px solid #d5dbe3;border-radius:6px;padding:14px}.metric strong{display:block;font-size:22px}"
+           << "table{border-collapse:collapse;width:100%}th,td{padding:9px;border-bottom:1px solid #ddd;text-align:left}"
+           << "</style></head><body><main><h1>market-pulse report</h1>"
+           << "<p>Cache-isolated SPSC market replay with measured producer-to-consumer handoff latency.</p>"
+           << "<h2>Run Summary</h2><div class=\"grid\">"
+           << "<div class=\"metric\"><strong>" << result.consumed << "</strong>consumed</div>"
+           << "<div class=\"metric\"><strong>" << result.events_per_second << "</strong>events/sec</div>"
+           << "<div class=\"metric\"><strong>" << result.ring.dropped << "</strong>actual drops</div>"
+           << "<div class=\"metric\"><strong>" << result.state_checksum << "</strong>state checksum</div></div>"
+           << "<h2>Measured Handoff Latency</h2><div class=\"grid\">"
+           << "<div class=\"metric\"><strong>" << result.p50_latency_ns << " ns</strong>p50</div>"
+           << "<div class=\"metric\"><strong>" << result.p99_latency_ns << " ns</strong>p99</div>"
+           << "<div class=\"metric\"><strong>" << result.p999_latency_ns << " ns</strong>p99.9</div></div>"
+           << "<h2>Configuration</h2><table>"
+           << "<tr><th>symbols</th><td>" << config.symbol_count << "</td></tr>"
+           << "<tr><th>events</th><td>" << config.event_count << "</td></tr>"
+           << "<tr><th>producer lanes</th><td>" << config.producer_count << "</td></tr>"
+           << "<tr><th>capacity per lane</th><td>" << config.capacity << "</td></tr>"
+           << "<tr><th>batch</th><td>" << config.consumer_batch << "</td></tr></table>"
+           << "<h2>Backpressure</h2><p>Full observations: " << result.ring.full_observations
+           << "; spin iterations: " << result.ring.spin_iterations << "; max lane depth: " << result.ring.max_depth << ".</p>"
+           << "<h2>Test Suite Coverage</h2><p>SPSC wraparound, batch reservations, concurrent integrity, deterministic state, metrics, and reports.</p>"
+           << "<p><code>market-pulse simulate --symbols " << config.symbol_count << " --events " << config.event_count
+           << " --producers " << config.producer_count << " --capacity " << config.capacity << "</code></p>"
+           << "</main></body></html>\n";
     return output.str();
 }
 
