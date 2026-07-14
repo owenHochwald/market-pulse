@@ -1,105 +1,122 @@
 # market-pulse
 
-`market-pulse` is a C++20 market replay engine built around a lock-free,
-multi-producer/single-consumer ring buffer. It generates exchange-style market
-events, pushes them through concurrent producers, drains them through one market
-state consumer, and reports the latency and backpressure metrics that show how
-the system behaves under load.
+`market-pulse` is a C++20 market replay and benchmarking engine built around
+cache-isolated, single-producer/single-consumer ingress lanes. Producers generate
+deterministic exchange-style events directly into preallocated queue storage. A
+single consumer batch-drains the lanes into per-symbol top-of-book state and
+reports real handoff latency, throughput, backpressure, and a deterministic state
+checksum.
 
-The project is meant to demonstrate systems work that is easy to run and inspect:
-lock-free data structures, deterministic replay, chaos testing, and a small CLI
-that can push a 5,000,000-event multi-producer replay in a release build.
-
-## Highlights
-
-- Lock-free bounded MPSC ring buffer with sequence-numbered slots.
-- Multi-producer market event replay into a single consumer.
-- Throughput-oriented release scenario for 5M+ events/sec on local hardware.
-- Chaos mode for halt/resume events, burst storms, timestamp skew, and
-  out-of-order feed behavior.
-- CLI metrics for accepted/consumed events, queue depth, retries, drops, and
-  p50/p95/p99 replay latency.
-- Generated HTML report with run metrics and a concise test-suite coverage view.
-- Self-contained CTest suite covering ring-buffer behavior, concurrency,
-  deterministic replay, chaos metrics, and CLI/report formatting.
-
-## Quick Start
-
-Download:
+## Build and test
 
 ```bash
-git clone https://github.com/owenHochwald/market-pulse.git && cd market-pulse
+cmake --preset release
+cmake --build --preset release
+ctest --preset release
 ```
 
-Build:
+For a machine-specific performance build with `-march=native` and IPO:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
+cmake --preset release-native
+cmake --build --preset release-native
+ctest --preset release-native
 ```
 
-See every CLI option:
+## Replay
 
 ```bash
-./build/market-pulse --help
+./build-release/market-pulse simulate \
+  --symbols 128 --events 5000000 --producers 4 \
+  --capacity 4096 --batch 16 --sample-rate 64
 ```
 
-Run a 5M-event multi-producer replay:
+`simulate` is lossless by default. `--chaos --backpressure drop` injects halt,
+resume, skew, and out-of-order signals while deliberately dropping events when a
+lane is full. Full-queue observations and spin retries are never reported as
+dropped events.
+
+The command prints stable key/value metrics and writes an HTML report unless
+`--no-report` is supplied.
+
+## Benchmarks
 
 ```bash
-./build/market-pulse simulate --symbols 128 --events 5000000 --producers 2 --capacity 8388608 --seed 7
+# Maximum sustained throughput: deep lanes, large batches, timing disabled.
+./build-native/market-pulse benchmark --profile throughput \
+  --symbols 128 --events 50000000 --producers 4 --repeats 5
+
+# Queue residence time: shallow lanes, one-at-a-time draining, 1/64 sampling.
+./build-native/market-pulse benchmark --profile latency \
+  --symbols 128 --events 5000000 --producers 2 --repeats 5
+
+# Mixed workload and machine-readable output.
+./build-native/market-pulse benchmark --profile balanced \
+  --events 10000000 --json reports/balanced.json
 ```
 
-Each simulation prints a terminal summary and writes a local HTML report:
+Profile defaults are intentionally different:
 
-```text
-html_report="/path/to/market-pulse-report.html"
-html_report_url=file:///path/to/market-pulse-report.html
-```
+| Profile | Lane capacity | Batch | Latency sampling |
+|---|---:|---:|---:|
+| `throughput` | 65,536 | 8,192 | off |
+| `latency` | 64 | 1 | every 64th event |
+| `balanced` | 1,024 | 16 | every 64th event |
 
-Open the `file://` URL in a browser to view a lightweight dashboard with run
-metrics, latency, backpressure, chaos signals, and test-suite coverage. Use
-`--report reports/run.html` to choose a path, or `--no-report` to skip HTML
-generation.
+Explicit `--capacity`, `--batch`, and `--sample-rate` values override these
+defaults. Linux runs can add `--pin`, `--cpus 2,4,6,8,10`, and `--huge-pages`.
+CPU lists place the consumer first and producers after it.
 
-Run with exchange-style chaos enabled:
+## Results
+
+Observed on an Apple-silicon laptop using the native Release build; affinity,
+invariant TSC timing, and huge-page advice are unavailable on this platform:
+
+| Scenario | Result |
+|---|---:|
+| Original shared MPSC, 5M events, 4 producers | 1.28 s median / 3.9M events/sec |
+| Sharded SPSC, 50M events, 4 producers | 0.07 s median / 714M events/sec |
+| Throughput benchmark, 100M events, 4 producers | 698M events/sec median |
+| Latency profile, 5M events, 2 producers | p50 1.8 us / p99 2.4 us / p99.9 8.5 us |
+
+The first two rows are whole-process measurements from the same compiler and
+non-native Release configuration. The new throughput run disables handoff timing;
+the old implementation had no way to disable its per-event telemetry and final
+latency-vector copies/sorts, so the table measures the intended throughput modes,
+not identical instrumentation. These are local observations, not
+hardware-independent promises. Use longer runs,
+pin workers, fix CPU frequency policy, and compare JSON from the same host when
+evaluating a change. Queue latency under deliberate saturation measures backlog;
+it is not an intrinsic operation-latency number.
+
+Compare saved results with explicit regression budgets:
 
 ```bash
-./build/market-pulse simulate --symbols 8 --events 10000 --producers 4 --capacity 4096 --seed 7 --chaos
+python3 scripts/compare_benchmarks.py baseline.json candidate.json \
+  --min-throughput-ratio 0.98 --max-p999-ratio 1.10
 ```
-
-## Test
-
-One command from the repo root:
-
-```bash
-cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on-failure
-```
-
-The suite validates:
-
-- Empty/full behavior, FIFO ordering, wraparound, and capacity validation.
-- Drop, depth, retry, and max-depth accounting.
-- Multi-producer event integrity.
-- Deterministic market replay counts.
-- Chaos-mode halt, skew, out-of-order, and burst-storm metrics.
-- CLI summary and HTML report output.
 
 ## Architecture
 
 ```text
-synthetic feed producers
-  -> lock-free RingBuffer<MarketEvent>
-  -> market-state consumer
-  -> latency, depth, retry, drop, and chaos metrics
+symbol-partitioned producers
+  -> one preallocated SPSC lane per producer
+  -> round-robin batch consumer
+  -> deterministic top-of-book state
+  -> off-hot-path aggregation and reports
 ```
 
-The ring buffer reserves producer slots with compare-and-swap, publishes events
-with per-slot sequence numbers, and uses power-of-two capacity so hot-path slot
-lookup is a mask operation. Normal replay retries on backpressure; chaos replay
-can intentionally drop events to model overloaded feeds.
+Each symbol belongs to exactly one producer, so events for that symbol retain
+order without a shared reservation counter. Events for independent symbols may
+interleave differently without changing the final checksum.
+
+See [docs/performance.md](docs/performance.md) for the complete data flow,
+memory-ordering contract, benchmark methodology, Linux tuning, PGO workflow, and
+an explanation of every optimization.
 
 ## Requirements
 
 - C++20 compiler
 - CMake 3.20+
-- pthreads-compatible threading support
+- pthread-compatible threads
+- Linux x86-64 for affinity, transparent huge-page advice, and invariant-TSC timing
