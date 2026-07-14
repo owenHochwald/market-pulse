@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [OFF, address, undefined, thread]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >-
+          cmake -S . -B build-ci
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DMARKET_PULSE_SANITIZER=${{ matrix.sanitizer }}
+      - name: Build
+        run: cmake --build build-ci --parallel 2
+      - name: Test
+        run: ctest --test-dir build-ci --output-on-failure

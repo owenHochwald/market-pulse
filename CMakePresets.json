@@ -1,0 +1,70 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "release",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "release-native",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build-native",
+      "cacheVariables": {
+        "MARKET_PULSE_NATIVE": "ON",
+        "MARKET_PULSE_IPO": "ON"
+      }
+    },
+    {
+      "name": "pgo-generate",
+      "inherits": "release-native",
+      "binaryDir": "${sourceDir}/build-pgo",
+      "cacheVariables": {
+        "MARKET_PULSE_PGO": "GENERATE"
+      }
+    },
+    {
+      "name": "pgo-use",
+      "inherits": "release-native",
+      "binaryDir": "${sourceDir}/build-pgo-use",
+      "cacheVariables": {
+        "MARKET_PULSE_PGO": "USE",
+        "MARKET_PULSE_PGO_PROFILE": "${sourceDir}/build-pgo/market-pulse.profdata"
+      }
+    },
+    {
+      "name": "ubsan",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-ubsan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MARKET_PULSE_SANITIZER": "undefined"
+      }
+    },
+    {
+      "name": "tsan",
+      "inherits": "ubsan",
+      "binaryDir": "${sourceDir}/build-tsan",
+      "cacheVariables": {
+        "MARKET_PULSE_SANITIZER": "thread"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "release" },
+    { "name": "release-native", "configurePreset": "release-native" },
+    { "name": "pgo-generate", "configurePreset": "pgo-generate" },
+    { "name": "pgo-use", "configurePreset": "pgo-use" },
+    { "name": "ubsan", "configurePreset": "ubsan" },
+    { "name": "tsan", "configurePreset": "tsan" }
+  ],
+  "testPresets": [
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
+    { "name": "release-native", "configurePreset": "release-native", "output": { "outputOnFailure": true } },
+    { "name": "ubsan", "configurePreset": "ubsan", "output": { "outputOnFailure": true } },
+    { "name": "tsan", "configurePreset": "tsan", "output": { "outputOnFailure": true } }
+  ]
+}

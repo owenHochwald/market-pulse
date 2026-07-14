@@ -1,3 +1,8 @@
 build/
 build-release/
+build-native/
+build-pgo/
+build-pgo-use/
+build-ubsan/
+build-tsan/
 .DS_Store
